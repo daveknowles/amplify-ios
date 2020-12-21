@@ -202,10 +202,12 @@ final class StorageEngine: StorageEngineBehavior {
                           modelSchema: ModelSchema,
                           withId id: Model.Identifier,
                           completion: @escaping (DataStoreResult<M?>) -> Void) {
-        let transactionResult = queryAndDeleteTransaction(modelType, modelSchema: modelSchema, predicate: field("id").eq(id))
+        let transactResult = queryAndDeleteTransaction(modelType, modelSchema: modelSchema, predicate: field("id").eq(id))
+        let mTransactionResult = collapseMResult(transactResult)
+        let associatedModels = resolveAssociatedModels(transactResult)
 
         let deletedModel: M
-        switch transactionResult {
+        switch mTransactionResult {
         case .success(let queriedModels):
             guard queriedModels.count <= 1 else {
                 completion(.failure(.unknown("delete with id returned more than one result", "", nil)))
@@ -245,6 +247,7 @@ final class StorageEngine: StorageEngineBehavior {
             self.syncDeletions(of: modelType,
                                modelSchema: modelSchema,
                                withModels: [deletedModel],
+                               associatedModels: associatedModels,
                                syncEngine: syncEngine,
                                completion: syncCompletionWrapper)
         } else {
@@ -256,7 +259,9 @@ final class StorageEngine: StorageEngineBehavior {
                           modelSchema: ModelSchema,
                           predicate: QueryPredicate,
                           completion: @escaping DataStoreCallback<[M]>) {
-        let transactionResult = queryAndDeleteTransaction(modelType, modelSchema: modelSchema, predicate: predicate)
+        let transactResult = queryAndDeleteTransaction(modelType, modelSchema: modelSchema, predicate: predicate)
+        let mTransactionResult = collapseMResult(transactResult)
+        let associatedModels = resolveAssociatedModels(transactResult)
 
         guard modelSchema.isSyncable, let syncEngine = self.syncEngine else {
             if !modelSchema.isSystem {
@@ -265,12 +270,12 @@ final class StorageEngine: StorageEngineBehavior {
             if self.syncEngine == nil {
                 log.error("Unable to sync because syncEngine is nil")
             }
-            completion(transactionResult)
+            completion(mTransactionResult)
             return
         }
 
-        guard case .success(let queriedModels) = transactionResult else {
-            completion(transactionResult)
+        guard case .success(let queriedModels) = mTransactionResult else {
+            completion(mTransactionResult)
             return
         }
 
@@ -278,23 +283,24 @@ final class StorageEngine: StorageEngineBehavior {
             let syncCompletionWrapper: DataStoreCallback<Void> = { syncResult in
                 switch syncResult {
                 case .success:
-                    completion(transactionResult)
+                    completion(mTransactionResult)
                 case .failure(let error):
                     completion(.failure(error))
                 }
             }
             if queriedModels.isEmpty {
-                completion(transactionResult)
+                completion(mTransactionResult)
             } else {
                 self.syncDeletions(of: modelType,
                                    modelSchema: modelSchema,
                                    withModels: queriedModels,
                                    predicate: predicate,
+                                   associatedModels: associatedModels,
                                    syncEngine: syncEngine,
                                    completion: syncCompletionWrapper)
             }
         } else {
-            completion(transactionResult)
+            completion(mTransactionResult)
         }
     }
 
@@ -368,6 +374,7 @@ final class StorageEngine: StorageEngineBehavior {
                                          modelSchema: ModelSchema,
                                          withModels models: [M],
                                          predicate: QueryPredicate? = nil,
+                                         associatedModels: [Model],
                                          syncEngine: RemoteSyncEngineBehavior,
                                          completion: @escaping DataStoreCallback<Void>) {
         var mutationEvents: Set<Model.Identifier> = []
@@ -404,11 +411,48 @@ final class StorageEngine: StorageEngineBehavior {
                     mutationEvents.insert(mutationEvent.modelId)
                     self.log.verbose("\(#function) successfully submitted to sync engine \(mutationEvent)")
                     if mutationEvents.count == models.count {
-                        completion(.successfulVoid)
+                        self.syncDeletions(of: associatedModels, syncEngine: syncEngine, completion: completion)
                     }
                 }
             }
 
+            submitToSyncEngine(mutationEvent: mutationEvent,
+                               syncEngine: syncEngine,
+                               completion: mutationEventCallback)
+        }
+    }
+
+    @available(iOS 13.0, *)
+    private func syncDeletions(of associatedModels: [Model],
+                               syncEngine: RemoteSyncEngineBehavior,
+                               completion: @escaping DataStoreCallback<Void>) {
+        guard !associatedModels.isEmpty else {
+            completion(.successfulVoid)
+            return
+        }
+        var mutationEvents: Set<Model.Identifier> = []
+        for associatedModel in associatedModels {
+            let mutationEvent: MutationEvent
+            do {
+                mutationEvent = try MutationEvent(untypedModel: associatedModel, mutationType: .delete)
+            } catch {
+                let dataStoreError = DataStoreError(error: error)
+                completion(.failure(dataStoreError))
+                return
+            }
+
+            let mutationEventCallback: DataStoreCallback<MutationEvent> = { result in
+                switch result {
+                case .failure(let dataStoreError):
+                    completion(.failure(dataStoreError))
+                case .success(let mutationEvent):
+                    mutationEvents.insert(mutationEvent.modelId)
+                    self.log.verbose("\(#function) successfully submitted to sync engine \(mutationEvent)")
+                    if mutationEvents.count == associatedModels.count {
+                        completion(.successfulVoid)
+                    }
+                }
+            }
             submitToSyncEngine(mutationEvent: mutationEvent,
                                syncEngine: syncEngine,
                                completion: mutationEventCallback)
